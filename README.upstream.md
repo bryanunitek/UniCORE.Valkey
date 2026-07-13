@@ -82,8 +82,8 @@ The above runs the main integration tests. Additional tests are started using:
     % make test-cluster  # Valkey Cluster integration tests
 
 More about running the integration tests can be found in
-[tests/README.md](tests/README.md) and for unit tests, see
-[src/unit/README.md](src/unit/README.md).
+[tests/README.md](https://git.unitek-systems.com/UniCORE/UniCORE.Valkey/src/branch/main/tests/README.md) (mirror: [GitHub](https://github.com/bryanunitek/UniCORE.Valkey/blob/main/tests/README.md)) and for unit tests, see
+[src/unit/README.md](https://git.unitek-systems.com/UniCORE/UniCORE.Valkey/src/branch/main/src/unit/README.md) (mirror: [GitHub](https://github.com/bryanunitek/UniCORE.Valkey/blob/main/src/unit/README.md)).
 
 ## Performance monitoring
 
