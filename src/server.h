@@ -142,6 +142,7 @@ struct ValkeyModule;
 #define CRON_DBS_PER_CALL 16
 #define CRON_DICTS_PER_DB 16
 #define NET_MAX_WRITES_PER_EVENT (1024 * 64)
+#define VALKEY_THREAD_STACK_SIZE (1024 * 1024 * 4)
 #define PROTO_SHARED_SELECT_CMDS 10
 #define OBJ_SHARED_INTEGERS 10000
 #define OBJ_SHARED_BULKHDR_LEN 32
@@ -520,11 +521,6 @@ typedef enum {
 #define TLS_CLIENT_FIELD_OFF 0
 #define TLS_CLIENT_FIELD_CN 1
 #define TLS_CLIENT_FIELD_URI 2
-
-/* Sanitize dump payload */
-#define SANITIZE_DUMP_NO 0
-#define SANITIZE_DUMP_YES 1
-#define SANITIZE_DUMP_CLIENTS 2
 
 /* Enable protected config/command */
 #define PROTECTED_ACTION_ALLOWED_NO 0
@@ -1013,23 +1009,18 @@ typedef struct readyList {
 /* This structure represents a user. This is useful for ACLs, the
  * user is associated to the connection after the connection is authenticated.
  * If there is no associated user, the connection uses the default user. */
-#define USER_COMMAND_BITS_COUNT 1024             /* The total number of command bits     \
-                                                   in the user structure. The last valid \
-                                                   command ID we can set in the user     \
-                                                   is USER_COMMAND_BITS_COUNT-1. */
-#define USER_FLAG_ENABLED (1 << 0)               /* The user is active. */
-#define USER_FLAG_DISABLED (1 << 1)              /* The user is disabled. */
-#define USER_FLAG_NOPASS (1 << 2)                /* The user requires no password, any   \
-                                                    provided password will work. For the \
-                                                    default user, this also means that   \
-                                                    no AUTH is needed, and every         \
-                                                    connection is immediately            \
-                                                    authenticated. */
-#define USER_FLAG_SANITIZE_PAYLOAD (1 << 3)      /* The user require a deep RESTORE \
-                                                  * payload sanitization. */
-#define USER_FLAG_SANITIZE_PAYLOAD_SKIP (1 << 4) /* The user should skip the     \
-                                                  * deep sanitization of RESTORE \
-                                                  * payload. */
+#define USER_COMMAND_BITS_COUNT 1024 /* The total number of command bits     \
+                                       in the user structure. The last valid \
+                                       command ID we can set in the user     \
+                                       is USER_COMMAND_BITS_COUNT-1. */
+#define USER_FLAG_ENABLED (1 << 0)   /* The user is active. */
+#define USER_FLAG_DISABLED (1 << 1)  /* The user is disabled. */
+#define USER_FLAG_NOPASS (1 << 2)    /* The user requires no password, any   \
+                                        provided password will work. For the \
+                                        default user, this also means that   \
+                                        no AUTH is needed, and every         \
+                                        connection is immediately            \
+                                        authenticated. */
 
 #define SELECTOR_FLAG_ROOT (1 << 0)        /* This is the root user permission \
                                             * selector. */
@@ -1414,6 +1405,14 @@ typedef struct client {
 
 /* Forward declaration */
 bool isImportSlotMigrationJob(slotMigrationJob *job);
+
+/* Absolute postpone mask from client IO offload state (not artificial READ hold). */
+static inline int clientConnPostponeMaskFromIOState(client *c) {
+    int mask = 0;
+    if (c->io_read_state != CLIENT_IDLE) mask |= CONN_POSTPONE_READ;
+    if (c->io_write_state != CLIENT_IDLE) mask |= CONN_POSTPONE_WRITE;
+    return mask;
+}
 
 /* Get the class of a client, used in order to enforce limits to different
  * classes of clients.
@@ -1972,7 +1971,6 @@ struct valkeyServer {
     int active_expire_effort;    /* From 1 (default) to 10, active effort. */
     int lazy_expire_disabled;    /* If > 0, don't trigger lazy expire */
     int active_defrag_enabled;
-    int sanitize_dump_payload;                   /* Enables deep sanitization for ziplist and listpack in RDB and RESTORE. */
     int skip_checksum_validation;                /* Disable checksum validation for RDB and RESTORE payload. */
     int rdb_version_check;                       /* Try to load RDB produced by a future version. */
     int jemalloc_bg_thread;                      /* Enable jemalloc background thread */
@@ -2389,6 +2387,7 @@ struct valkeyServer {
     /* Local environment */
     char *locale_collate;
     char *debug_context; /* A free-form string that has no impact on server except being included in a crash report. */
+    int debug_force_tls_write_error;
 };
 
 #define MAX_KEYS_BUFFER 256
@@ -3050,10 +3049,11 @@ void waitForClientIO(client *c);
 void ioThreadReadQueryFromClient(client *c);
 void ioThreadWriteToClient(client *c);
 int canParseCommand(client *c);
-void processClientIOReadsDone(client *c);
+int processClientIOReadsDone(client *c);
 void processClientIOWriteDone(client *c);
 void releaseReplyReferences(client *c);
 void resetLastWrittenBuf(client *c);
+int clientConnPostponeMask(client *c);
 
 int parseExtendedCommandArgumentsOrReply(client *c, int command_type, int start_idx, int max_args, int *flags, int *unit, int *expire_idx, robj **expire, robj **compare_val);
 
@@ -4303,6 +4303,7 @@ void debugPauseProcess(void);
 #define serverDebug(fmt, ...) printf("DEBUG %s:%d > " fmt "\n", __FILE__, __LINE__, __VA_ARGS__)
 #define serverDebugMark() printf("-- MARK %s:%d --\n", __FILE__, __LINE__)
 
+void serverInitThreadAttribute(pthread_attr_t *attr);
 int iAmPrimary(void);
 
 #define STRINGIFY_(x) #x

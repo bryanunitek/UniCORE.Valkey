@@ -150,8 +150,6 @@ struct ACLUserFlag {
     {"on", USER_FLAG_ENABLED},
     {"off", USER_FLAG_DISABLED},
     {"nopass", USER_FLAG_NOPASS},
-    {"skip-sanitize-payload", USER_FLAG_SANITIZE_PAYLOAD_SKIP},
-    {"sanitize-payload", USER_FLAG_SANITIZE_PAYLOAD},
     {NULL, 0} /* Terminator. */
 };
 
@@ -436,7 +434,6 @@ static user *ACLCreateUser(const char *name, size_t namelen) {
     user *u = zmalloc(sizeof(*u));
     u->name = sdsnewlen(name, namelen);
     u->flags = USER_FLAG_DISABLED;
-    u->flags |= USER_FLAG_SANITIZE_PAYLOAD;
     u->passwords = listCreate();
     u->acl_string = NULL;
     listSetMatchMethod(u->passwords, ACLListMatchSds);
@@ -1334,8 +1331,6 @@ static int ACLSetSelector(aclSelector *selector, const char *op, size_t oplen) {
  * off          Disable the user: it's no longer possible to authenticate
  *              with this user, however the already authenticated connections
  *              will still work.
- * skip-sanitize-payload    RESTORE dump-payload sanitization is skipped.
- * sanitize-payload         RESTORE dump-payload is sanitized (default).
  * ><password>  Add this password to the list of valid password for the user.
  *              For example >mypass will add "mypass" to the list.
  *              This directive clears the "nopass" flag (see later).
@@ -1412,12 +1407,9 @@ int ACLSetUser(user *u, const char *op, ssize_t oplen) {
     } else if (!strcasecmp(op, "off")) {
         u->flags |= USER_FLAG_DISABLED;
         u->flags &= ~USER_FLAG_ENABLED;
-    } else if (!strcasecmp(op, "skip-sanitize-payload")) {
-        u->flags |= USER_FLAG_SANITIZE_PAYLOAD_SKIP;
-        u->flags &= ~USER_FLAG_SANITIZE_PAYLOAD;
-    } else if (!strcasecmp(op, "sanitize-payload")) {
-        u->flags &= ~USER_FLAG_SANITIZE_PAYLOAD_SKIP;
-        u->flags |= USER_FLAG_SANITIZE_PAYLOAD;
+    } else if (!strcasecmp(op, "skip-sanitize-payload") || !strcasecmp(op, "sanitize-payload")) {
+        /* These flags are deprecated and have no effect. Accept them silently
+         * for backwards compatibility with old ACL files. */
     } else if (!strcasecmp(op, "nopass")) {
         u->flags |= USER_FLAG_NOPASS;
         listEmpty(u->passwords);
@@ -1489,7 +1481,6 @@ int ACLSetUser(user *u, const char *op, ssize_t oplen) {
         /* Reset to `alldbs` for backwards compatibility */
         serverAssert(ACLSetUser(u, "alldbs", -1) == C_OK);
         serverAssert(ACLSetUser(u, "off", -1) == C_OK);
-        serverAssert(ACLSetUser(u, "sanitize-payload", -1) == C_OK);
         serverAssert(ACLSetUser(u, "clearselectors", -1) == C_OK);
         serverAssert(ACLSetUser(u, "-@all", -1) == C_OK);
     } else {
@@ -1866,17 +1857,28 @@ static int ACLSelectorCheckCmd(aclSelector *selector,
         int *positions = cmd->get_dbid_args(argv, argc, &count);
         if (positions) {
             for (int i = 0; i < count; i++) {
-                long long dbid;
+                long long argdbid;
                 /* The helper has already validated argv[positions[i]] as a
                  * valid in-range dbid, so this should never fail. */
-                serverAssert(getLongLongFromObject(argv[positions[i]], &dbid) == C_OK);
-                if (!ACLSelectorCanAccessDb(selector, (int)dbid)) {
+                serverAssert(getLongLongFromObject(argv[positions[i]], &argdbid) == C_OK);
+                if (!ACLSelectorCanAccessDb(selector, (int)argdbid)) {
                     if (keyidxptr) *keyidxptr = positions[i];
                     zfree(positions);
                     return ACL_DENIED_DB;
                 }
             }
             zfree(positions);
+        }
+        /* Commands such as MOVE and COPY also read from / operate on the keys
+         * in the current database, not just the destination database named in
+         * their arguments. The current database must therefore be authorized
+         * as well, otherwise a user without access to the current DB could use
+         * MOVE/COPY to exfiltrate its keys into a database it can access.
+         * This only applies to commands that carry real keys: SELECT and SWAPDB
+         * also declare dbid args but do not touch the current DB's keys. */
+        if (doesCommandHaveKeys(cmd) && !ACLSelectorCanAccessDb(selector, dbid)) {
+            if (keyidxptr) *keyidxptr = 0;
+            return ACL_DENIED_DB;
         }
     } else if ((cmd->flags & CMD_ALL_DBS) && !(selector->flags & SELECTOR_FLAG_ALLDBS)) {
         for (int i = 0; i < server.dbnum; i++) {

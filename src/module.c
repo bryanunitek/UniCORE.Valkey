@@ -9580,8 +9580,10 @@ typedef struct moduleClusterNodeInfo {
 } moduleClusterNodeInfo;
 
 /* We have an array of message types: each bucket is a linked list of
- * configured receivers. */
-static moduleClusterReceiver *clusterReceivers[UINT8_MAX];
+ * configured receivers. The array covers the full uint8_t range, so
+ * every valid cluster message type (0..255) has a bucket. */
+#define NUM_CLUSTER_MESSAGE_TYPES (UINT8_MAX + 1)
+static moduleClusterReceiver *clusterReceivers[NUM_CLUSTER_MESSAGE_TYPES];
 
 /* Dispatch the message to the right module receiver. */
 void moduleCallClusterReceivers(const char *sender_id,
@@ -9612,7 +9614,10 @@ void moduleCallClusterReceivers(const char *sender_id,
  * will be invoked with details, including the 40-byte node ID of the sender.
  *
  * In Valkey 8.1 and later, the node ID is null-terminated. Prior to 8.1, it was
- * not null-terminated */
+ * not null-terminated.
+ *
+ * Note: Old versions of Valkey could not handle type 255. This was fixed in
+ * 9.1.2, 9.0.6, 8.1.10, 8.0.11 and 7.2.15. */
 void VM_RegisterClusterMessageReceiver(ValkeyModuleCtx *ctx,
                                        uint8_t type,
                                        ValkeyModuleClusterMessageReceiver callback) {
@@ -9907,14 +9912,26 @@ long long moduleTimerHandler(struct aeEventLoop *eventLoop, long long id, void *
         memcpy(&expiretime, ri.key, sizeof(expiretime));
         expiretime = ntohu64(expiretime);
         if (now >= expiretime) {
+            /* Preserve the timer ID before invoking the callback. The callback
+             * may call ValkeyModule_StopTimer() on the currently firing timer,
+             * which removes the radix-tree entry and frees the timer object.
+             * Also, other tree mutations in the callback can invalidate ri.key. */
+            ValkeyModuleTimerID current_id;
+            memcpy(&current_id, ri.key, sizeof(current_id));
+
             ValkeyModuleTimer *timer = ri.data;
             ValkeyModuleCtx ctx;
             moduleCreateContext(&ctx, timer->module, VALKEYMODULE_CTX_TEMP_CLIENT);
             selectDb(ctx.client, timer->dbid);
             timer->callback(&ctx, timer->data);
             moduleFreeContext(&ctx);
-            raxRemove(Timers, (unsigned char *)ri.key, ri.key_len, NULL);
-            zfree(timer);
+
+            /* Skip cleanup if the callback already stopped this timer. */
+            void *live = NULL;
+            if (raxFind(Timers, (unsigned char *)&current_id, sizeof(current_id), &live) && live == timer) {
+                raxRemove(Timers, (unsigned char *)&current_id, sizeof(current_id), NULL);
+                zfree(timer);
+            }
         } else {
             /* We call ustime() again instead of using the cached 'now' so that
              * 'next_period' isn't affected by the time it took to execute
@@ -13292,6 +13309,30 @@ void moduleUnregisterCommands(struct ValkeyModule *module) {
     invalidateCommandCache();
 }
 
+/* Remove every cluster message receiver that belongs to the given module. */
+static void moduleUnregisterClusterReceivers(ValkeyModule *module) {
+    if (!server.cluster_enabled) return;
+
+    for (int type = 0; type < NUM_CLUSTER_MESSAGE_TYPES; type++) {
+        moduleClusterReceiver *r = clusterReceivers[type], *prev = NULL;
+        while (r) {
+            if (r->module == module) {
+                /* Unlink the receiver node from the linked list. A module
+                 * registers at most one receiver per type, so we can stop
+                 * scanning this type as soon as we removed it. */
+                if (prev)
+                    prev->next = r->next;
+                else
+                    clusterReceivers[type] = r->next;
+                zfree(r);
+                break;
+            }
+            prev = r;
+            r = r->next;
+        }
+    }
+}
+
 /* We parse argv to add sds "NAME VALUE" pairs to the server.module_configs_queue list of configs.
  * We also increment the module_argv pointer to just after ARGS if there are args, otherwise
  * we set it to NULL */
@@ -13344,6 +13385,7 @@ void moduleUnregisterCleanup(ValkeyModule *module) {
     moduleUnsubscribeAllServerEvents(module);
     moduleRemoveConfigs(module);
     moduleUnregisterAuthCBs(module);
+    moduleUnregisterClusterReceivers(module);
 }
 
 /* Common helper for moduleLoad and moduleLoadStatic.
@@ -14510,7 +14552,8 @@ ValkeyModuleScriptingEngineExecutionState VM_GetFunctionExecutionState(
  * These messages are buffered in memory, and are only sent to the client when
  * `ValkeyModule_VM_ScriptingEngineDebuggerFlushLogs` is called.
  *
- * - `msg`: the message to send.
+ * - `msg`: the message to send. Ownership of `msg` is transferred to the
+ *   debugger log. The caller must not free it or access it after this call.
  *
  * - `truncate`: if set to 1, the message will be truncated to the maximum length
  *   configured in the debugger settings.

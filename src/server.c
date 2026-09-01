@@ -2320,6 +2320,7 @@ void initServerConfig(void) {
     server.page_size = sysconf(_SC_PAGESIZE);
     server.extended_redis_compat = 0;
     server.pause_cron = 0;
+    server.debug_force_tls_write_error = 0;
     server.dict_resizing = 1;
     server.import_mode = 0;
 
@@ -3849,6 +3850,14 @@ void call(client *c, int flags) {
     c->flag.force_aof = 0;
     c->flag.force_repl = 0;
     c->flag.prevent_prop = 0;
+
+    /* The redaction bitmap describes the argv of the command about to execute and
+     * is set on demand by the command itself. Clearing it here covers every case
+     * where one client executes several commands without an intervening
+     * resetClient(): the queued commands of a MULTI, RM_Call sequences issued on a
+     * reused module temp client, and the server.call() chain of a script. Stale
+     * bits would otherwise redact the wrong argument of a later command. */
+    c->redact_arg_bitmap = 0;
 
     /* The server core is in charge of propagation when the first entry point
      * of call() is processCommand().
@@ -7435,6 +7444,17 @@ int iAmPrimary(void) {
             (server.cluster_enabled && clusterNodeIsPrimary(getMyClusterNode())));
 }
 
+/* Initialize thread attribute with a guarded stack size.
+ * Doubling the stack size until it is at least VALKEY_THREAD_STACK_SIZE. */
+void serverInitThreadAttribute(pthread_attr_t *attr) {
+    size_t stacksize;
+    pthread_attr_init(attr);
+    pthread_attr_getstacksize(attr, &stacksize);
+    if (!stacksize) stacksize = 1;
+    while (stacksize < VALKEY_THREAD_STACK_SIZE) stacksize *= 2;
+    pthread_attr_setstacksize(attr, stacksize);
+}
+
 /* Main is marked as weak so that unit tests can use their own main function. */
 __attribute__((weak)) int main(int argc, char **argv) {
     struct timeval tv;
@@ -7700,8 +7720,10 @@ __attribute__((weak)) int main(int argc, char **argv) {
     }
 
 #if defined(LUA_ENABLED) && STATIC_LUA
-    /* Initialize the LUA scripting engine on-startup only when LUA is built statically */
-    if (scriptingEngineManagerFind("lua") == NULL) {
+    /* Initialize the LUA scripting engine on-startup only when LUA is built statically.
+     * Sentinel does not support SCRIPTING commands nor the MODULE commands, so the Lua
+     * engine is not needed here. */
+    if (!server.sentinel_mode && scriptingEngineManagerFind("lua") == NULL) {
         if (moduleLoadStatic("lua", NULL, 0, 0) != C_OK) {
             serverPanic("Lua engine initialization failed, check the server logs.");
         }

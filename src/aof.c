@@ -1492,6 +1492,10 @@ struct client *createAOFClient(void) {
 
     c->id = CLIENT_ID_AOF; /* So modules can identify it's the AOF client. */
 
+    /* The AOF client is not subject to ACL checks because all commands present
+     * in the AOF file must be replayed. */
+    c->user = NULL;
+
     /*
      * The AOF client should never be blocked (unlike primary
      * replication connection).
@@ -1588,8 +1592,9 @@ int loadSingleAppendOnlyFile(char *filename) {
             ret = AOF_FAILED;
             goto cleanup;
         } else {
-            loadingAbsProgress(ftello(fp));
-            last_progress_report_size = ftello(fp);
+            valid_up_to = ftello(fp);
+            loadingAbsProgress(valid_up_to);
+            last_progress_report_size = valid_up_to;
             if (old_style) serverLog(LL_NOTICE, "Reading the remaining AOF tail...");
         }
     }
@@ -1703,11 +1708,7 @@ int loadSingleAppendOnlyFile(char *filename) {
      * If the client is in the middle of a MULTI/EXEC, handle it as it was
      * a short read, even if technically the protocol is correct: we want
      * to remove the unprocessed tail and continue. */
-    if (fakeClient->flag.multi) {
-        serverLog(LL_WARNING, "Revert incomplete MULTI/EXEC transaction in AOF file %s", filename);
-        valid_up_to = valid_before_multi;
-        goto uxeof;
-    }
+    if (fakeClient->flag.multi) goto uxeof;
 
 loaded_ok: /* DB loaded, cleanup and return success (AOF_OK or AOF_TRUNCATED). */
     loadingIncrProgress(ftello(fp) - last_progress_report_size);
@@ -1722,6 +1723,10 @@ readerr: /* Read error. If feof(fp) is true, fall through to unexpected EOF. */
     }
 
 uxeof: /* Unexpected AOF end of file. */
+    if (fakeClient->flag.multi) {
+        serverLog(LL_WARNING, "Revert incomplete MULTI/EXEC transaction in AOF file %s", filename);
+        valid_up_to = valid_before_multi;
+    }
     if (server.aof_load_truncated) {
         serverLog(LL_WARNING, "!!! Warning: short read while loading the AOF file %s!!!", filename);
         serverLog(LL_WARNING, "!!! Truncating the AOF %s at offset %llu !!!", filename,
